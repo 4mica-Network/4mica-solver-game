@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+react-demo/node_modules/
+
+# Build output
+dist/
+react-demo/dist/
+out/
+artifacts/
+cache/
+
+# Environment files with secrets
+.env
+.env.local
+.env.sepolia
+
+# Keep example
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+
+# TypeScript
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Foundry
+broadcast/

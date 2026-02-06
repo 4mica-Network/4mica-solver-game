@@ -1,0 +1,10 @@
+{
+  "usdc": "0x6d2bbf0ec147686a0d1c2367bda7512baa5ac560",
+  "usdt": "0xe5d45b55041a80ba141bedb03e4dffa30b33e794",
+  "ammAlpha": "0x451383e50696c7b584a63dc0c81011df4262ef37",
+  "ammBeta": "0x48f0b315940111f10eca6042ac1d058bec37bce9",
+  "deployedAt": "2026-02-05T19:36:40.892Z",
+  "deployer": "0x4931f15771236297837e8f81a189c4ca58c9Fc36",
+  "chainId": 11155111,
+  "network": "sepolia"
+}
