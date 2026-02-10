@@ -363,6 +363,36 @@ export const Core4MicaABI = [
   },
   {
     type: 'function',
+    name: 'payTabInERC20Token',
+    inputs: [
+      { name: 'tabId', type: 'uint256' },
+      { name: 'reqId', type: 'uint256' },
+      { name: 'amount', type: 'uint256' },
+      { name: 'recipient', type: 'address' },
+      { name: 'token', type: 'address' },
+    ],
+    outputs: [],
+    stateMutability: 'nonpayable',
+  },
+  {
+    type: 'function',
+    name: 'remunerate',
+    inputs: [
+      { name: 'tabId', type: 'uint256' },
+      { name: 'reqId', type: 'uint256' },
+    ],
+    outputs: [],
+    stateMutability: 'nonpayable',
+  },
+  {
+    type: 'function',
+    name: 'getLatestReqId',
+    inputs: [{ name: 'tabId', type: 'uint256' }],
+    outputs: [{ type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    type: 'function',
     name: 'settleTab',
     inputs: [{ name: 'tabId', type: 'uint256' }],
     outputs: [],

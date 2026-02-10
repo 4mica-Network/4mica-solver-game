@@ -47,6 +47,7 @@ contract Core4Mica {
     mapping(address => mapping(address => UserCollateral)) public collateral; // user => asset => collateral
     mapping(uint256 => Tab) public tabs;
     mapping(uint256 => mapping(uint256 => Guarantee)) public guarantees; // tabId => reqId => guarantee
+    mapping(uint256 => uint256) public latestReqIds; // tabId => latest reqId with a guarantee
 
     uint256 public nextTabId = 1;
     uint256 public withdrawalDelay = 1 hours;
@@ -223,6 +224,11 @@ contract Core4Mica {
             claimed: false
         });
 
+        // Track latest reqId for this tab
+        if (reqId >= latestReqIds[tabId]) {
+            latestReqIds[tabId] = reqId;
+        }
+
         emit CollateralLocked(tab.user, tab.asset, amount);
         emit GuaranteeIssued(tabId, reqId, amount);
     }
@@ -255,6 +261,82 @@ contract Core4Mica {
 
         emit CollateralUnlocked(g.user, g.asset, g.amount);
         emit GuaranteeClaimed(tabId, reqId, netAmount);
+    }
+
+    /**
+     * @dev Pay tab with ERC20 token (happy path)
+     * Called by the trader (tab.user) to pay the recipient directly.
+     * This releases the locked collateral for the specified guarantee.
+     * Matches the real 4Mica SDK's UserClient.payTab() signature.
+     */
+    function payTabInERC20Token(
+        uint256 tabId,
+        uint256 reqId,
+        uint256 amount,
+        address recipient,
+        address token
+    ) external {
+        Tab storage tab = tabs[tabId];
+        require(tab.active, "Tab not active");
+        require(!tab.settled, "Tab already settled");
+        require(msg.sender == tab.user, "Not tab user");
+        require(recipient == tab.recipient, "Recipient mismatch");
+        require(token == tab.asset, "Token mismatch");
+
+        Guarantee storage g = guarantees[tabId][reqId];
+        require(g.amount > 0, "Guarantee not found");
+        require(!g.claimed, "Already claimed");
+
+        // Transfer tokens from trader to recipient
+        MockERC20(token).transferFrom(msg.sender, recipient, amount);
+
+        // Release locked collateral (guarantee is satisfied by direct payment)
+        UserCollateral storage c = collateral[tab.user][tab.asset];
+        g.claimed = true;
+        c.locked -= g.amount;
+        tab.totalPaid += amount;
+
+        emit CollateralUnlocked(tab.user, tab.asset, g.amount);
+        emit GuaranteeClaimed(tabId, reqId, amount);
+    }
+
+    /**
+     * @dev Remunerate (unhappy path) - Recipient seizes locked collateral
+     * Called by the solver/recipient when trader fails to pay.
+     * Equivalent to claimGuarantee but named to match SDK's RecipientClient.remunerate().
+     */
+    function remunerate(uint256 tabId, uint256 reqId) external {
+        Guarantee storage g = guarantees[tabId][reqId];
+        require(g.amount > 0, "Guarantee not found");
+        require(!g.claimed, "Already claimed");
+        require(msg.sender == g.recipient, "Not recipient");
+
+        Tab storage tab = tabs[tabId];
+        UserCollateral storage c = collateral[g.user][g.asset];
+
+        // Calculate fee
+        uint256 fee = (g.amount * protocolFee) / FEE_DENOMINATOR;
+        uint256 netAmount = g.amount - fee;
+
+        // Update state
+        g.claimed = true;
+        c.locked -= g.amount;
+        c.total -= g.amount;
+        tab.totalPaid += g.amount;
+        totalFeesCollected += fee;
+
+        // Transfer collateral to recipient
+        MockERC20(g.asset).transfer(g.recipient, netAmount);
+
+        emit CollateralUnlocked(g.user, g.asset, g.amount);
+        emit GuaranteeClaimed(tabId, reqId, netAmount);
+    }
+
+    /**
+     * @dev Get latest reqId for a tab (view function for mock SDK)
+     */
+    function getLatestReqId(uint256 tabId) external view returns (uint256) {
+        return latestReqIds[tabId];
     }
 
     /**

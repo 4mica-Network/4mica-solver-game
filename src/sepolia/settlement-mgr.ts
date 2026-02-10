@@ -101,6 +101,9 @@ export class SettlementManager extends EventEmitter {
   private traderTabs: Map<string, TraderTab> = new Map();
   private activeSettlements: Map<string, SettlementStatus> = new Map();
 
+  // Track in-flight settlement promises per trader to prevent concurrent on-chain txs
+  private pendingSettlements: Map<string, Promise<TabSettlementResult>> = new Map();
+
   // 4Mica Solver client (for X402 flow - Solver talks to facilitator)
   private fourMicaSolverClient: FourMicaClient | null = null;
 
@@ -262,8 +265,6 @@ export class SettlementManager extends EventEmitter {
         privateKey: this.config.solverPrivateKey,
         accountId: 'settlement-solver',
         tokenAddress: this.config.tokenAddress,
-        // In local mode, facilitatorUrl points to mock 4Mica API
-        facilitatorUrl: this.config.fourMicaRpcUrl.replace(/\/$/, ''),
       });
       await this.fourMicaSolverClient.initialize();
       console.log(`[SettlementManager] Solver client initialized with @4mica/sdk`);
@@ -384,6 +385,20 @@ export class SettlementManager extends EventEmitter {
 
     const traderId = intent.traderId;
     const now = Date.now();
+
+    // Wait for any in-flight settlement for this trader to complete before
+    // creating or modifying a tab. This prevents overwriting a 'settling' tab
+    // in the map, which would cause concurrent on-chain txs (nonce collisions).
+    const pendingSettlement = this.pendingSettlements.get(traderId);
+    if (pendingSettlement) {
+      console.log(`[SettlementManager] Waiting for ${traderId}'s pending settlement to complete before adding intent...`);
+      try {
+        await pendingSettlement;
+      } catch {
+        // Settlement may have failed — that's OK, we still proceed with the new intent
+        console.warn(`[SettlementManager] Previous settlement for ${traderId} had an error, proceeding with new intent`);
+      }
+    }
 
     // CHECK: Does the intent already have a guarantee from the game server?
     // If so, use it instead of issuing a new one (prevents double-locking!)
@@ -537,6 +552,9 @@ export class SettlementManager extends EventEmitter {
     for (const [traderId, tab] of this.traderTabs) {
       if (tab.status !== 'open') continue;
 
+      // Skip traders that already have an in-flight settlement (prevents nonce collisions)
+      if (this.pendingSettlements.has(traderId)) continue;
+
       const secondsRemaining = Math.floor((tab.deadline - now) / 1000);
       tab.secondsRemaining = secondsRemaining;
       const isOverdue = secondsRemaining <= 0;
@@ -547,22 +565,38 @@ export class SettlementManager extends EventEmitter {
       // Check if trader "pays" before deadline (happy path)
       if (tab.willPay && tab.scheduledPaymentTime && now >= tab.scheduledPaymentTime) {
         console.log(`[SettlementManager] ${traderId} paid tab with ${secondsRemaining}s remaining - Happy path!`);
-        this.settleTab(traderId, true);
+        this.startSettlement(traderId, true);
         continue;
       }
 
       // Check if deadline reached without payment (unhappy path)
       if (isOverdue && !tab.willPay) {
         console.log(`[SettlementManager] ${traderId}'s tab deadline reached - Unhappy path!`);
-        this.settleTab(traderId, false);
+        this.startSettlement(traderId, false);
         continue;
       }
 
       if (isOverdue) {
         console.log(`[SettlementManager] ${traderId}'s tab deadline reached - settling based on payment status`);
-        this.settleTab(traderId, tab.willPay);
+        this.startSettlement(traderId, tab.willPay);
       }
     }
+  }
+
+  /**
+   * Start a settlement and track the promise to prevent concurrent on-chain txs
+   * from the same trader wallet (which causes "replacement transaction underpriced").
+   */
+  private startSettlement(traderId: string, isHappyPath: boolean, txHash?: string): void {
+    const promise = this.settleTab(traderId, isHappyPath, txHash)
+      .catch(err => {
+        console.error(`[SettlementManager] Settlement failed for ${traderId}:`, err);
+        throw err;
+      })
+      .finally(() => {
+        this.pendingSettlements.delete(traderId);
+      });
+    this.pendingSettlements.set(traderId, promise as Promise<TabSettlementResult>);
   }
 
   /**
@@ -719,10 +753,16 @@ export class SettlementManager extends EventEmitter {
   }
 
   async settleTraderTab(traderId: string, txHash?: string): Promise<TabSettlementResult> {
+    // Wait for any in-flight settlement to finish first
+    const pending = this.pendingSettlements.get(traderId);
+    if (pending) await pending.catch(() => {});
     return this.settleTab(traderId, true, txHash);
   }
 
   async enforceTraderTab(traderId: string, txHash?: string): Promise<TabSettlementResult> {
+    // Wait for any in-flight settlement to finish first
+    const pending = this.pendingSettlements.get(traderId);
+    if (pending) await pending.catch(() => {});
     return this.settleTab(traderId, false, txHash);
   }
 

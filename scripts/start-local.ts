@@ -38,8 +38,6 @@ dotenvConfig({ path: join(projectRoot, '.env.local') });
 // =============================================================================
 
 const HARDHAT_PORT = 8545;
-const MOCK_4MICA_PORT = parseInt(process.env.MOCK_4MICA_PORT || '3003');
-const FACILITATOR_PORT = parseInt(process.env.MOCK_FACILITATOR_PORT || '3002');
 const GAME_SERVER_PORT = parseInt(process.env.SERVER_PORT || '3001');
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
@@ -76,14 +74,6 @@ function startProcess(name: string, command: string, args: string[], env?: Recor
         if (name === 'hardhat' && output.includes('Started HTTP')) {
           started = true;
           console.log(chalk.green(`  ✓ ${name} started on port ${HARDHAT_PORT}`));
-          resolve();
-        } else if (name === 'mock-4mica' && output.includes('Mock 4Mica API running')) {
-          started = true;
-          console.log(chalk.green(`  ✓ ${name} started on port ${MOCK_4MICA_PORT}`));
-          resolve();
-        } else if (name === 'facilitator' && output.includes('Mock 4Mica Facilitator running')) {
-          started = true;
-          console.log(chalk.green(`  ✓ ${name} started on port ${FACILITATOR_PORT}`));
           resolve();
         } else if (name === 'game-server' && output.includes('Game server started')) {
           started = true;
@@ -207,20 +197,8 @@ async function main(): Promise<void> {
     console.log(chalk.gray(`    USDC: ${deployments.usdc}`));
     console.log(chalk.gray(`    AMM-Alpha: ${deployments.ammAlpha}`));
 
-    // 3. Start Mock 4Mica API (full RPC + Facilitator simulation)
-    console.log(chalk.cyan('\n2. Starting Mock 4Mica API...\n'));
-    await startProcess(
-      'mock-4mica',
-      'node',
-      ['dist/src/local/mock-4mica-api.js'],
-      { MOCK_4MICA_PORT: MOCK_4MICA_PORT.toString() }
-    );
-
-    // Wait for mock 4Mica API to be ready
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    // 4. Start Game Server (configured for local mock 4Mica)
-    console.log(chalk.cyan('\n3. Starting Game Server...\n'));
+    // 3. Start Game Server (uses mock SDK against Hardhat — no separate mock API needed)
+    console.log(chalk.cyan('\n2. Starting Game Server...\n'));
     await startProcess(
       'game-server',
       'node',
@@ -228,17 +206,17 @@ async function main(): Promise<void> {
       {
         // Override to use local configuration
         LOCAL_RPC_URL: `http://localhost:${HARDHAT_PORT}`,
-        // Point 4Mica SDK to local mock API
-        FOURMICA_RPC_URL: `http://localhost:${MOCK_4MICA_PORT}/`,
-        FOURMICA_FACILITATOR_URL: `http://localhost:${MOCK_4MICA_PORT}`,
-        // Use local mode (SDK connects to mock, not real 4Mica)
+        // Point 4Mica SDK to Hardhat (mock SDK handles all operations on-chain)
+        FOURMICA_RPC_URL: `http://localhost:${HARDHAT_PORT}`,
+        FOURMICA_FACILITATOR_URL: `http://localhost:${HARDHAT_PORT}`,
+        // Use local mode (loads mock SDK instead of real @4mica/sdk)
         LOCAL_MODE: 'true',
       }
     );
 
-    // 5. Optionally start AI Agents (if GROQ_API_KEY is set)
+    // 4. Optionally start AI Agents (if GROQ_API_KEY is set)
     if (startAgents) {
-      console.log(chalk.cyan('\n4. Starting AI Agents (Groq LLM)...\n'));
+      console.log(chalk.cyan('\n3. Starting AI Agents (Groq LLM)...\n'));
 
       // Wait a bit for game server to be fully ready
       await new Promise(resolve => setTimeout(resolve, 2000));
@@ -260,8 +238,8 @@ async function main(): Promise<void> {
     console.log(chalk.cyan('  Endpoints:'));
     console.log(chalk.white(`    Game Server:      http://localhost:${GAME_SERVER_PORT}`));
     console.log(chalk.white(`    Dashboard:        http://localhost:${GAME_SERVER_PORT}`));
-    console.log(chalk.white(`    Mock 4Mica API:   http://localhost:${MOCK_4MICA_PORT}`));
     console.log(chalk.white(`    Hardhat Node:     http://localhost:${HARDHAT_PORT}`));
+    console.log(chalk.gray(`    (Mock SDK operates directly against Hardhat — no separate API)`));
     console.log();
 
     if (startAgents) {

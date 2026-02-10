@@ -25,7 +25,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { hardhat } from 'viem/chains';
-import { MockERC20ABI, SimpleAMMABI } from '../src/lib/abis.js';
+import { MockERC20ABI, SimpleAMMABI, Core4MicaABI } from '../src/lib/abis.js';
 import chalk from 'chalk';
 import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
@@ -120,6 +120,7 @@ interface DeployedContracts {
   usdt: Address;
   ammAlpha: Address;
   ammBeta: Address;
+  core4Mica: Address;
   deployedAt: string;
   deployer: Address;
   chainId: number;
@@ -183,10 +184,12 @@ async function deploy(): Promise<DeployedContracts> {
   console.log(chalk.cyan('\n📦 Loading contract bytecodes...'));
   let mockERC20Bytecode: `0x${string}`;
   let simpleAMMBytecode: `0x${string}`;
+  let core4MicaBytecode: `0x${string}`;
 
   try {
     mockERC20Bytecode = loadContractBytecode('MockERC20');
     simpleAMMBytecode = loadContractBytecode('SimpleAMM');
+    core4MicaBytecode = loadContractBytecode('Core4Mica');
     console.log(chalk.green('  ✓ Bytecodes loaded'));
   } catch (error) {
     console.log(chalk.red('\n❌ Contract artifacts not found. Compile contracts first:'));
@@ -314,6 +317,36 @@ async function deploy(): Promise<DeployedContracts> {
   console.log(chalk.green(`  ✓ Added ${formatTokenAmount(liquidityBetaUsdc)} USDC + ${formatTokenAmount(liquidityBetaUsdt)} USDT`));
 
   // ==========================================================================
+  // Deploy Core4Mica contract
+  // ==========================================================================
+
+  console.log(chalk.cyan('\n🏛️  Deploying Core4Mica...'));
+  const core4MicaHash = await walletClient.deployContract({
+    abi: Core4MicaABI,
+    bytecode: core4MicaBytecode,
+    args: [],
+  });
+  const core4MicaReceipt = await publicClient.waitForTransactionReceipt({ hash: core4MicaHash });
+  const core4MicaAddress = core4MicaReceipt.contractAddress!;
+  console.log(chalk.green(`  ✓ Core4Mica deployed: ${core4MicaAddress}`));
+
+  // Add supported assets
+  console.log(chalk.cyan('\n🔧 Configuring Core4Mica...'));
+  await walletClient.writeContract({
+    address: core4MicaAddress,
+    abi: Core4MicaABI,
+    functionName: 'addSupportedAsset',
+    args: [usdcAddress],
+  });
+  await walletClient.writeContract({
+    address: core4MicaAddress,
+    abi: Core4MicaABI,
+    functionName: 'addSupportedAsset',
+    args: [usdtAddress],
+  });
+  console.log(chalk.green('  ✓ USDC and USDT added as supported assets'));
+
+  // ==========================================================================
   // Fund test accounts
   // ==========================================================================
 
@@ -344,11 +377,51 @@ async function deploy(): Promise<DeployedContracts> {
     console.log(chalk.green(`  ✓ ${acc.name}: ${acc.address.slice(0, 10)}... (${formatTokenAmount(fundAmount)} each)`));
   }
 
+  // ==========================================================================
+  // Deposit collateral for traders into Core4Mica
+  // ==========================================================================
+
+  console.log(chalk.cyan('\n🔐 Depositing trader collateral into Core4Mica...'));
+  const collateralAmount = 50_000_000000n; // 50k USDC each
+
+  const traderAccounts = [
+    { name: 'Trader-1', key: HARDHAT_ACCOUNTS.trader1.privateKey, address: HARDHAT_ACCOUNTS.trader1.address },
+    { name: 'Trader-2', key: HARDHAT_ACCOUNTS.trader2.privateKey, address: HARDHAT_ACCOUNTS.trader2.address },
+  ];
+
+  for (const trader of traderAccounts) {
+    const traderAccount = privateKeyToAccount(trader.key);
+    const traderWallet = createWalletClient({
+      account: traderAccount,
+      chain: hardhat,
+      transport: http(config.rpcUrl),
+    });
+
+    // Approve Core4Mica to pull USDC
+    await traderWallet.writeContract({
+      address: usdcAddress,
+      abi: MockERC20ABI,
+      functionName: 'approve',
+      args: [core4MicaAddress, collateralAmount],
+    });
+
+    // Deposit collateral
+    await traderWallet.writeContract({
+      address: core4MicaAddress,
+      abi: Core4MicaABI,
+      functionName: 'deposit',
+      args: [usdcAddress, collateralAmount],
+    });
+
+    console.log(chalk.green(`  ✓ ${trader.name}: deposited ${formatTokenAmount(collateralAmount)} USDC as collateral`));
+  }
+
   return {
     usdc: usdcAddress,
     usdt: usdtAddress,
     ammAlpha: ammAlphaAddress,
     ammBeta: ammBetaAddress,
+    core4Mica: core4MicaAddress,
     deployedAt: new Date().toISOString(),
     deployer: account.address,
     chainId: config.chainId,
@@ -396,6 +469,7 @@ USDC_ADDRESS=${deployment.usdc}
 USDT_ADDRESS=${deployment.usdt}
 AMM_ALPHA_ADDRESS=${deployment.ammAlpha}
 AMM_BETA_ADDRESS=${deployment.ammBeta}
+CORE_4MICA_ADDRESS=${deployment.core4Mica}
 
 # =============================================================================
 # TEST ACCOUNTS (Hardhat default accounts - DO NOT USE IN PRODUCTION)
@@ -415,14 +489,14 @@ SOLVER_BALANCED_PRIVATE_KEY=${HARDHAT_ACCOUNTS.solver3.privateKey}
 # =============================================================================
 
 SERVER_PORT=3001
-MOCK_4MICA_PORT=3003
 PRICE_CHECK_INTERVAL_MS=2000
 SPREAD_THRESHOLD_BPS=30
 SETTLEMENT_WINDOW_SECONDS=30
 
-# Local mode uses mock 4Mica API (full RPC + facilitator simulation)
-FOURMICA_RPC_URL=http://localhost:3003/
-FOURMICA_FACILITATOR_URL=http://localhost:3003
+# Local mode uses mock SDK against Hardhat (same code paths as Sepolia)
+FOURMICA_RPC_URL=http://127.0.0.1:8545
+FOURMICA_FACILITATOR_URL=http://127.0.0.1:8545
+FOURMICA_USDC_ADDRESS=${deployment.usdc}
 LOCAL_MODE=true
 
 # =============================================================================
@@ -452,6 +526,7 @@ API_BASE_URL=http://localhost:3001
     console.log(`    USDT:      ${deployment.usdt}`);
     console.log(`    AMM-Alpha: ${deployment.ammAlpha}`);
     console.log(`    AMM-Beta:  ${deployment.ammBeta}`);
+    console.log(`    Core4Mica: ${deployment.core4Mica}`);
     console.log();
     console.log(chalk.cyan('  Test Accounts:'));
     console.log(`    Trader-1:  ${deployment.accounts.trader1}`);

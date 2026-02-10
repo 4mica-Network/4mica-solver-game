@@ -1,37 +1,69 @@
 /**
  * 4Mica SDK Client Wrapper for 4Mica × Agent0 Competitive Solver Game
  *
- * Uses official @4mica/sdk directly for all operations:
+ * Uses @4mica/sdk directly for Sepolia, or the drop-in mock-sdk for
+ * local Hardhat testing. Both share identical code paths:
+ *
  * 1. RecipientClient.createTab() — Solver opens a tab for a trader
  * 2. PaymentSigner.signRequest() — Trader signs the guarantee claims (EIP-712)
  * 3. RecipientClient.issuePaymentGuarantee() — Solver submits to get BLS certificate
  * 4. UserClient.payTab() — Happy path: trader pays the tab on-chain
  * 5. RecipientClient.remunerate() — Unhappy path: solver seizes collateral on-chain
+ *
+ * The SDK module is selected at runtime:
+ *   - LOCAL_MODE=true  → mock-sdk (Hardhat + Core4Mica contract)
+ *   - LOCAL_MODE=false → @4mica/sdk (Sepolia testnet)
  */
 
-import {
-  Client,
-  ConfigBuilder,
-  SigningScheme,
-  PaymentGuaranteeRequestClaims,
-  PaymentSigner,
-  buildPaymentPayload,
-  type PaymentRequirementsV2,
-  type X402SignedPayment,
-} from '@4mica/sdk';
+// Type-only imports from real SDK (used for type annotations only)
 import type {
   BLSCert,
   UserInfo,
+  PaymentRequirementsV2,
+  X402SignedPayment,
 } from '@4mica/sdk';
 
 import type { Address, Hash, TransactionReceipt } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
 // =============================================================================
+// SDK Module Type (both real and mock export these)
+// =============================================================================
+
+interface SDKModule {
+  Client: {
+    new: (cfg: any) => Promise<any>;
+  };
+  ConfigBuilder: new () => {
+    rpcUrl: (v: string) => any;
+    walletPrivateKey: (v: string) => any;
+    enableAuth: () => any;
+    build: () => any;
+  };
+  SigningScheme: { EIP712: string; EIP191?: string };
+  PaymentGuaranteeRequestClaims: {
+    new: (
+      userAddress: string,
+      recipientAddress: string,
+      tabId: number | bigint | string,
+      amount: number | bigint | string,
+      timestamp: number,
+      erc20Token?: string | null,
+      reqId?: number | bigint | string
+    ) => any;
+  };
+  PaymentSigner: new (account: any) => {
+    signer: any;
+    signRequest: (params: any, claims: any, scheme: any) => Promise<any>;
+  };
+  buildPaymentPayload: (claims: any, sig: any) => any;
+}
+
+// =============================================================================
 // Constants
 // =============================================================================
 
-// The 4Mica facilitator endpoint for x402 payments (used only for local mock)
+// The 4Mica facilitator endpoint for x402 payments (Sepolia only)
 const FOURMICA_FACILITATOR_URL = 'https://x402.4mica.xyz';
 
 // =============================================================================
@@ -82,25 +114,30 @@ export interface SettlementResult {
 }
 
 // =============================================================================
-// 4Mica Client Implementation (Direct SDK)
+// 4Mica Client Implementation (Unified SDK)
 // =============================================================================
 
 export class FourMicaClient {
   private config: FourMicaClientConfig;
-  private client: Client | null = null;
+  private client: any = null; // SDK Client instance (real or mock)
+  private sdk: SDKModule | null = null; // The loaded SDK module
   private initialized: boolean = false;
   private userAddress: Address | null = null;
   private facilitatorUrl: string;
 
-  // Local mode flag - when true, skip SDK and use direct mock API calls
+  // Local mode flag - determines which SDK module to load
   private localMode: boolean = false;
 
   constructor(config: FourMicaClientConfig) {
     this.config = config;
     this.facilitatorUrl = config.facilitatorUrl || FOURMICA_FACILITATOR_URL;
 
-    // Detect local mode: if rpcUrl points to localhost:3003 (mock 4Mica API)
-    this.localMode = config.rpcUrl.includes('localhost:3003') || config.rpcUrl.includes('127.0.0.1:3003');
+    // Detect local mode from environment or RPC URL
+    this.localMode = process.env.LOCAL_MODE === 'true' ||
+      config.rpcUrl.includes('localhost:8545') ||
+      config.rpcUrl.includes('127.0.0.1:8545') ||
+      config.rpcUrl.includes('localhost:3003') ||
+      config.rpcUrl.includes('127.0.0.1:3003');
   }
 
   // ===========================================================================
@@ -110,25 +147,26 @@ export class FourMicaClient {
   async initialize(): Promise<void> {
     if (this.initialized) return;
 
-    // In local mode, skip SDK initialization and use mock API directly
-    if (this.localMode) {
-      await this.initializeLocalMode();
-      return;
-    }
-
     try {
-      console.log(`  [4Mica] Initializing client for ${this.config.rpcUrl}`);
+      // Load the appropriate SDK module
+      this.sdk = this.localMode
+        ? await import('./mock-sdk/index.js') as unknown as SDKModule
+        : await import('@4mica/sdk') as unknown as SDKModule;
 
-      // Initialize @4mica/sdk Client for SIWE auth, collateral, and tab operations
-      const cfg = new ConfigBuilder()
+      const sdkLabel = this.localMode ? 'mock-sdk (Hardhat)' : '@4mica/sdk (Sepolia)';
+      console.log(`  [4Mica] Initializing client with ${sdkLabel}`);
+
+      // Build config using ConfigBuilder (identical for both SDKs)
+      const cfg = new this.sdk.ConfigBuilder()
         .rpcUrl(this.config.rpcUrl)
         .walletPrivateKey(this.config.privateKey)
         .enableAuth()
         .build();
 
-      this.client = await Client.new(cfg);
+      // Create and authenticate client
+      this.client = await this.sdk.Client.new(cfg);
       await this.client.login();
-      console.log(`  [4Mica] Authenticated with SIWE`);
+      console.log(`  [4Mica] Authenticated${this.localMode ? ' (mock)' : ' with SIWE'}`);
 
       this.userAddress = this.client.signer.signer.address as Address;
 
@@ -143,151 +181,6 @@ export class FourMicaClient {
     }
   }
 
-  /**
-   * Initialize in local mode - uses mock API directly without SDK
-   * This allows local testing without the full 4Mica SDK infrastructure
-   */
-  private async initializeLocalMode(): Promise<void> {
-    console.log(`  [4Mica] LOCAL MODE: Initializing with mock API at ${this.config.rpcUrl}`);
-    console.log(`  [4Mica] LOCAL MODE: Skipping SDK initialization (not supported for local networks)`);
-
-    // Get user address from private key
-    const account = privateKeyToAccount(this.config.privateKey);
-    this.userAddress = account.address as Address;
-
-    console.log(`  [4Mica] LOCAL MODE: Client initialized for address: ${this.userAddress}`);
-    this.initialized = true;
-  }
-
-  /**
-   * LOCAL MODE: Issue payment guarantee directly via mock API
-   * Bypasses the SDK entirely for local testing
-   */
-  private async issuePaymentGuaranteeLocalMode(
-    traderAddress: Address,
-    amount: bigint,
-    token: Address,
-    recipientAddress: Address,
-    maxTimeoutSeconds: number
-  ): Promise<PaymentGuarantee> {
-    console.log(`  [4Mica] LOCAL MODE: Issuing guarantee via mock API`);
-    console.log(`  [4Mica] LOCAL MODE: ${this.formatAmount(amount)} from ${traderAddress.slice(0, 10)}... to ${recipientAddress.slice(0, 10)}...`);
-
-    // Step 1: Create a tab directly via mock API
-    const tabResponse = await fetch(`${this.facilitatorUrl}/tabs`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userAddress: traderAddress,
-        recipientAddress: recipientAddress,
-        amount: amount.toString(),
-        asset: token,
-        maxTimeoutSeconds,
-      }),
-    });
-
-    if (!tabResponse.ok) {
-      const errorText = await tabResponse.text();
-      throw new Error(`Failed to create tab: ${tabResponse.status} ${errorText}`);
-    }
-
-    const tabData = await tabResponse.json() as {
-      tabId: string;
-      tab_id?: string;
-      reqId: string;
-      req_id?: string;
-      timestamp: number;
-    };
-
-    const tabIdStr = tabData.tabId || tabData.tab_id || '0x1';
-    const reqIdStr = tabData.reqId || tabData.req_id || '0x1';
-    const tabId = tabIdStr.startsWith('0x') ? BigInt(tabIdStr) : BigInt(tabIdStr);
-    const reqId = reqIdStr.startsWith('0x') ? BigInt(reqIdStr) : BigInt(reqIdStr);
-    const timestamp = tabData.timestamp || Math.floor(Date.now() / 1000);
-
-    console.log(`  [4Mica] LOCAL MODE: Tab created: tabId=${tabId}, reqId=${reqId}`);
-
-    // Step 2: Generate mock signature (in real flow, trader would sign)
-    const mockSignature = '0x' + 'e'.repeat(130); // Mock EIP-712 signature
-
-    // Build SDK-aligned claims + payload (for type compatibility)
-    const claims = PaymentGuaranteeRequestClaims.new(
-      traderAddress,
-      recipientAddress,
-      tabId,
-      amount,
-      timestamp,
-      token,
-      reqId
-    );
-    const mockPaymentSig = { signature: mockSignature, scheme: SigningScheme.EIP712 };
-    const paymentPayload = buildPaymentPayload(claims, mockPaymentSig);
-
-    // Step 3: Issue guarantee via mock API RPC
-    const guaranteeResponse = await fetch(this.config.rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'issuePaymentGuarantee',
-        params: [{
-          tabId: tabId.toString(),
-          reqId: reqId.toString(),
-          userAddress: traderAddress,
-          recipientAddress,
-          amount: amount.toString(),
-          assetAddress: token,
-          timestamp,
-        }, mockSignature, 'EIP712'],
-      }),
-    });
-
-    const guaranteeResult = await guaranteeResponse.json() as {
-      result?: { claims: string; signature: string };
-      error?: { code: number; message: string };
-    };
-
-    if (guaranteeResult.error) {
-      throw new Error(guaranteeResult.error.message);
-    }
-
-    console.log(`  [4Mica] LOCAL MODE: Guarantee issued! Collateral locked.`);
-
-    // Build mock BLS certificate
-    const blsCertificate: BLSCert = {
-      claims: guaranteeResult.result?.claims || JSON.stringify({ tabId: tabId.toString(), amount: amount.toString() }),
-      signature: guaranteeResult.result?.signature || '0x' + 'f'.repeat(128),
-    } as BLSCert;
-
-    // Build mock signed payment (minimal structure — not used for settlement)
-    const signedPayment: X402SignedPayment = {
-      header: Buffer.from(JSON.stringify({
-        x402Version: 1,
-        scheme: '4mica-credit',
-        network: 'eip155:11155111',
-        payload: paymentPayload,
-      })).toString('base64'),
-      payload: paymentPayload,
-      signature: mockPaymentSig,
-    };
-
-    return {
-      certificate: blsCertificate,
-      claims: {
-        tabId,
-        amount,
-        recipient: recipientAddress,
-        deadline: Math.floor(Date.now() / 1000) + maxTimeoutSeconds,
-        nonce: reqId,
-      },
-      signedPayment,
-      issuedAt: Date.now(),
-      expiresAt: (Math.floor(Date.now() / 1000) + maxTimeoutSeconds) * 1000,
-      verified: true,
-    };
-  }
-
   // ===========================================================================
   // Collateral Management (User operations)
   // ===========================================================================
@@ -296,13 +189,7 @@ export class FourMicaClient {
     await this.ensureInitialized();
     console.log(`  [4Mica] Approving ${this.formatAmount(amount)} of token ${tokenAddress}`);
 
-    if (this.localMode) {
-      // In local mode, return mock tx hash - approvals happen on local chain directly
-      console.log(`  [4Mica] LOCAL MODE: Mock approval (local chain handles this)`);
-      return '0x' + 'a'.repeat(64) as Hash;
-    }
-
-    const receipt = await this.client!.user.approveErc20(tokenAddress, amount);
+    const receipt = await this.client.user.approveErc20(tokenAddress, amount);
     return receipt.transactionHash;
   }
 
@@ -312,24 +199,7 @@ export class FourMicaClient {
     if (!token) throw new Error('Token address required');
     console.log(`  [4Mica] Depositing ${this.formatAmount(amount)}`);
 
-    if (this.localMode) {
-      // In local mode, call mock API directly
-      console.log(`  [4Mica] LOCAL MODE: Mock deposit via API`);
-      const response = await fetch(this.config.rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'deposit',
-          params: [this.userAddress, amount.toString(), token],
-        }),
-      });
-      const result = await response.json() as { result?: { txHash: string } };
-      return (result.result?.txHash || '0x' + 'b'.repeat(64)) as Hash;
-    }
-
-    const receipt = await this.client!.user.deposit(amount, token);
+    const receipt = await this.client.user.deposit(amount, token);
     return receipt.transactionHash;
   }
 
@@ -337,50 +207,8 @@ export class FourMicaClient {
     await this.ensureInitialized();
     const tokenAddress = this.config.tokenAddress || ('0x' as Address);
 
-    if (this.localMode) {
-      // In local mode, call mock API directly
-      const response = await fetch(this.config.rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'getUserAssetBalance',
-          params: [this.userAddress, tokenAddress],
-        }),
-      });
-      const result = await response.json() as { result?: { total: string; locked: string } | null };
-
-      if (result.result) {
-        const total = BigInt(result.result.total || '0');
-        const locked = BigInt(result.result.locked || '0');
-        const available = total - locked;
-
-        console.log(`  [4Mica] LOCAL MODE: Collateral status: total=${this.formatAmount(total)}, locked=${this.formatAmount(locked)}, available=${this.formatAmount(available)}`);
-
-        return {
-          address: this.userAddress!,
-          tokenAddress,
-          deposited: total,
-          available,
-          locked,
-          pendingWithdrawal: BigInt(0),
-        };
-      }
-
-      // User not registered - return zeros
-      return {
-        address: this.userAddress!,
-        tokenAddress,
-        deposited: BigInt(0),
-        available: BigInt(0),
-        locked: BigInt(0),
-        pendingWithdrawal: BigInt(0),
-      };
-    }
-
     // Use getUserAssetBalance on RecipientClient for actual locked amounts
-    const balanceInfo = await this.client!.recipient.getUserAssetBalance(
+    const balanceInfo = await this.client.recipient.getUserAssetBalance(
       this.userAddress!,
       tokenAddress
     );
@@ -393,8 +221,8 @@ export class FourMicaClient {
       console.log(`  [4Mica] Collateral status for ${this.userAddress?.slice(0, 10)}...: total=${this.formatAmount(total)}, locked=${this.formatAmount(locked)}, available=${this.formatAmount(available)}`);
 
       // Also get withdrawal info from getUser
-      const userInfos: UserInfo[] = await this.client!.user.getUser();
-      const userInfo = userInfos.find(u => u.asset.toLowerCase() === tokenAddress.toLowerCase());
+      const userInfos: UserInfo[] = await this.client.user.getUser();
+      const userInfo = userInfos.find((u: UserInfo) => u.asset.toLowerCase() === tokenAddress.toLowerCase());
 
       return {
         address: this.userAddress!,
@@ -407,15 +235,15 @@ export class FourMicaClient {
     }
 
     // Fallback to getUser if getUserAssetBalance returns null
-    const userInfos: UserInfo[] = await this.client!.user.getUser();
-    const userInfo = userInfos.find(u => u.asset.toLowerCase() === tokenAddress.toLowerCase());
+    const userInfos: UserInfo[] = await this.client.user.getUser();
+    const userInfo = userInfos.find((u: UserInfo) => u.asset.toLowerCase() === tokenAddress.toLowerCase());
 
     if (userInfo) {
       return {
         address: this.userAddress!,
         tokenAddress,
         deposited: userInfo.collateral,
-        available: userInfo.collateral, // No locked info available from this method
+        available: userInfo.collateral,
         locked: BigInt(0),
         pendingWithdrawal: userInfo.withdrawalRequestAmount,
       };
@@ -436,21 +264,15 @@ export class FourMicaClient {
   // ===========================================================================
 
   /**
-   * Issue a payment guarantee using the @4mica/sdk directly.
+   * Issue a payment guarantee using the SDK (real or mock).
    *
-   * FLOW (Sepolia):
+   * FLOW (identical for both Sepolia and local Hardhat):
    * 1. RecipientClient.createTab() — Solver opens tab for the trader
    * 2. PaymentSigner.signRequest() — Trader signs claims with EIP-712
    * 3. RecipientClient.issuePaymentGuarantee() — Solver submits to get BLS cert
    *
    * The BLS certificate locks the trader's collateral. This is the core
    * guarantee that enables the happy/unhappy settlement paths.
-   *
-   * @param traderAddress - The address of the trader (payer)
-   * @param amount - Amount to be paid
-   * @param tokenAddress - Token address (defaults to config token)
-   * @param maxTimeoutSeconds - Tab timeout (TTL)
-   * @param traderPrivateKey - The trader's private key (required to sign the payment)
    */
   async issuePaymentGuarantee(
     traderAddress: Address,
@@ -463,33 +285,20 @@ export class FourMicaClient {
     const token = tokenAddress || this.config.tokenAddress;
     if (!token) throw new Error('Token address required');
 
-    // The Solver's address (this client's address) is the recipient
-    const recipientAddress = this.userAddress!;
-
-    // LOCAL MODE: Bypass SDK entirely and use mock API directly
-    if (this.localMode) {
-      return this.issuePaymentGuaranteeLocalMode(
-        traderAddress,
-        amount,
-        token,
-        recipientAddress,
-        maxTimeoutSeconds
-      );
-    }
-
     if (!traderPrivateKey) {
       throw new Error('Trader private key required to sign payment guarantee');
     }
+
+    // The Solver's address (this client's address) is the recipient
+    const recipientAddress = this.userAddress!;
 
     console.log(`  [4Mica] Issuing guarantee via SDK: ${this.formatAmount(amount)} from ${traderAddress.slice(0, 10)}... to ${recipientAddress.slice(0, 10)}...`);
 
     // =========================================================================
     // Step 1: Solver creates a tab as the RECIPIENT
-    // RecipientClient.createTab() sends an authenticated RPC to 4Mica core.
-    // This returns a tabId — no HTTP facilitator endpoint involved.
     // =========================================================================
     console.log(`  [4Mica] Creating tab (Solver as recipient)...`);
-    const tabId = await this.client!.recipient.createTab(
+    const tabId = await this.client.recipient.createTab(
       traderAddress,         // userAddress (payer)
       recipientAddress,      // recipientAddress (Solver)
       token,                 // erc20Token
@@ -499,12 +308,10 @@ export class FourMicaClient {
 
     // =========================================================================
     // Step 2: Determine reqId for this guarantee
-    // For a fresh tab the first reqId is 0. For subsequent guarantees
-    // on the same tab (accumulated intents), query the latest.
     // =========================================================================
     let reqId = 0n;
     try {
-      const latest = await this.client!.recipient.getLatestGuarantee(tabId);
+      const latest = await this.client.recipient.getLatestGuarantee(tabId);
       if (latest) {
         reqId = latest.reqId + 1n;
         console.log(`  [4Mica] Existing guarantees found, using reqId=${reqId}`);
@@ -517,7 +324,7 @@ export class FourMicaClient {
     // Step 3: Build PaymentGuaranteeRequestClaims
     // =========================================================================
     const timestamp = Math.floor(Date.now() / 1000);
-    const claims = PaymentGuaranteeRequestClaims.new(
+    const claims = this.sdk!.PaymentGuaranteeRequestClaims.new(
       traderAddress,     // userAddress (payer)
       recipientAddress,  // recipientAddress (Solver)
       tabId,             // tabId from createTab
@@ -530,31 +337,27 @@ export class FourMicaClient {
 
     // =========================================================================
     // Step 4: Sign with TRADER's key using PaymentSigner
-    // PaymentSigner uses the CorePublicParameters (EIP-712 domain from 4Mica core)
-    // to produce a proper EIP-712 typed data signature. No full Client needed.
     // =========================================================================
     const traderAccount = privateKeyToAccount(traderPrivateKey);
-    const traderSigner = new PaymentSigner(traderAccount);
+    const traderSigner = new this.sdk!.PaymentSigner(traderAccount);
     console.log(`  [4Mica] Signing claims with trader's key (${traderAccount.address.slice(0, 10)}...)`);
 
     const paymentSig = await traderSigner.signRequest(
-      this.client!.params,    // CorePublicParameters (eip712Name, version, chainId)
-      claims,                 // PaymentGuaranteeRequestClaims
-      SigningScheme.EIP712    // Signing scheme
+      this.client.params,             // CorePublicParameters
+      claims,                         // PaymentGuaranteeRequestClaims
+      this.sdk!.SigningScheme.EIP712  // Signing scheme
     );
     console.log(`  [4Mica] Claims signed: ${paymentSig.signature.slice(0, 30)}...`);
 
-    const paymentPayload = buildPaymentPayload(claims, paymentSig);
+    const paymentPayload = this.sdk!.buildPaymentPayload(claims, paymentSig);
 
     // =========================================================================
-    // Step 5: Issue guarantee — Solver submits to 4Mica as RECIPIENT
-    // This is the critical step: 4Mica verifies the signature, checks the trader's
-    // collateral, and issues a BLS certificate. The trader's collateral is now LOCKED.
+    // Step 5: Issue guarantee — Solver submits to get BLS cert
     // =========================================================================
-    console.log(`  [4Mica] Submitting to 4Mica for BLS certificate (locks collateral)...`);
+    console.log(`  [4Mica] Submitting for BLS certificate (locks collateral)...`);
     let blsCertificate: BLSCert;
     try {
-      blsCertificate = await this.client!.recipient.issuePaymentGuarantee(
+      blsCertificate = await this.client.recipient.issuePaymentGuarantee(
         claims,
         paymentSig.signature,
         paymentSig.scheme
@@ -570,15 +373,11 @@ export class FourMicaClient {
     // =========================================================================
     // Build return value
     // =========================================================================
-
-    // X402SignedPayment — constructed for type compatibility.
-    // The header is a base64-encoded X402 envelope (version + scheme + network).
-    // The payload contains the signed claims in the X402PaymentPayload format.
     const signedPayment: X402SignedPayment = {
       header: Buffer.from(JSON.stringify({
         x402Version: 1,
         scheme: '4mica-credit',
-        network: `eip155:${this.client!.params.chainId}`,
+        network: `eip155:${this.client.params.chainId}`,
         payload: paymentPayload,
       })).toString('base64'),
       payload: paymentPayload,
@@ -608,7 +407,7 @@ export class FourMicaClient {
   /**
    * Happy path: Pay a tab within the deadline.
    * Called by the TRADER (payer) to fulfill their obligation.
-   * This sends an on-chain transaction via the 4Mica Core contract.
+   * This sends an on-chain transaction via the Core contract.
    */
   async payTab(
     tabId: bigint,
@@ -623,47 +422,11 @@ export class FourMicaClient {
 
     console.log(`  [4Mica] Paying tab ${tabId} - ${this.formatAmount(amount)} to ${recipientAddress.slice(0, 10)}...`);
 
-    // In local mode, call mock API directly
-    if (this.localMode) {
-      console.log(`  [4Mica] LOCAL MODE: Calling mock payTab`);
-      const response = await fetch(this.config.rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'payTab',
-          params: [tabId.toString(), reqId.toString(), amount.toString(), recipientAddress, token],
-        }),
-      });
-      const result = await response.json() as {
-        result?: { transactionHash: string; status: string; gasUsed: string };
-        error?: { message: string };
-      };
-
-      if (result.error) {
-        throw new Error(result.error.message);
-      }
-
-      console.log(`  [4Mica] LOCAL MODE: Tab paid successfully`);
-      return {
-        success: result.result?.status === 'success',
-        txHash: (result.result?.transactionHash || '0x' + 'c'.repeat(64)) as Hash,
-        gasUsed: BigInt(result.result?.gasUsed || '50000'),
-        settlementType: 'happy',
-        amount,
-        recipient: recipientAddress,
-      };
-    }
-
-    // Sepolia: use SDK's UserClient to approve + pay on-chain
-    const fourMicaContractAddress = this.client!.params.contractAddress as Address;
-    console.log(`  [4Mica] Contract address: ${fourMicaContractAddress}`);
-
-    // Ensure ERC20 approval for the 4Mica contract
-    console.log(`  [4Mica] Ensuring ERC20 approval for 4Mica contract...`);
+    // Ensure ERC20 approval for the contract
+    const contractAddress = this.client.params.contractAddress as Address;
+    console.log(`  [4Mica] Ensuring ERC20 approval for contract ${contractAddress.slice(0, 10)}...`);
     try {
-      const approvalReceipt = await this.client!.user.approveErc20(token, amount);
+      const approvalReceipt = await this.client.user.approveErc20(token, amount);
       console.log(`  [4Mica] Approval confirmed in block ${approvalReceipt.blockNumber}`);
     } catch (approvalError: any) {
       if (approvalError?.message?.includes('allowance') || approvalError?.message?.includes('already')) {
@@ -674,30 +437,51 @@ export class FourMicaClient {
     }
 
     // Call UserClient.payTab() — on-chain transaction
-    const receipt: TransactionReceipt = await this.client!.user.payTab(
-      tabId,
-      reqId,
-      amount,
-      recipientAddress,
-      token
-    );
-    console.log(`  [4Mica] Tab paid successfully, tx: ${receipt.transactionHash}`);
+    // Retry up to 3 times for transient errors (nonce collisions, receipt timeouts)
+    const MAX_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const receipt: TransactionReceipt = await this.client.user.payTab(
+          tabId,
+          reqId,
+          amount,
+          recipientAddress,
+          token
+        );
+        console.log(`  [4Mica] Tab paid successfully, tx: ${receipt.transactionHash}`);
 
-    return {
-      success: receipt.status === 'success',
-      txHash: receipt.transactionHash,
-      gasUsed: receipt.gasUsed,
-      settlementType: 'happy',
-      amount,
-      recipient: recipientAddress,
-    };
+        return {
+          success: receipt.status === 'success',
+          txHash: receipt.transactionHash,
+          gasUsed: receipt.gasUsed,
+          settlementType: 'happy' as const,
+          amount,
+          recipient: recipientAddress,
+        };
+      } catch (error: any) {
+        const msg = error?.message || error?.shortMessage || '';
+        const isRetryable =
+          msg.includes('replacement transaction underpriced') ||
+          msg.includes('could not be found') ||
+          msg.includes('nonce too low');
+
+        if (isRetryable && attempt < MAX_RETRIES) {
+          const delayMs = attempt * 5000;
+          console.warn(`  [4Mica] payTab attempt ${attempt} failed (${msg.slice(0, 80)}...), retrying in ${delayMs / 1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new Error('payTab: exhausted retries');
   }
 
   /**
    * Unhappy path: Seize locked collateral via RecipientClient.remunerate()
    * Called by the SOLVER (recipient) when the trader fails to pay before deadline.
    * Uses the BLS certificate from issuePaymentGuarantee as proof.
-   * This is a direct on-chain call — no facilitator HTTP endpoint involved.
    */
   async enforceRemuneration(
     blsCertificate: BLSCert,
@@ -705,38 +489,9 @@ export class FourMicaClient {
   ): Promise<SettlementResult> {
     await this.ensureInitialized();
     console.log(`  [4Mica] Requesting remuneration (on-chain collateral seizure)...`);
-
-    if (this.localMode) {
-      // In local mode, call mock API's /remunerate REST endpoint
-      const response = await fetch(`${this.facilitatorUrl}/remunerate`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          certificate: blsCertificate,
-        }),
-      });
-
-      if (!response.ok) {
-        const text = await response.text();
-        throw new Error(`Local remuneration failed: ${response.status} ${text}`);
-      }
-
-      const result = await response.json() as { txHash?: string; gasUsed?: string | number };
-      console.log(`  [4Mica] LOCAL MODE: Remuneration processed`);
-
-      return {
-        success: true,
-        txHash: (result.txHash || '0x' + 'e'.repeat(64)) as Hash,
-        gasUsed: BigInt(result.gasUsed || 0),
-        settlementType: 'unhappy',
-        amount: BigInt(0),
-        recipient: '0x' as Address,
-      };
-    }
-
-    // Sepolia: Use SDK's RecipientClient.remunerate(cert) for on-chain collateral seizure.
     console.log(`  [4Mica] Calling SDK remunerate (claims ${blsCertificate.claims.length} chars, sig ${blsCertificate.signature.length} chars)...`);
-    const receipt = await this.client!.recipient.remunerate(blsCertificate);
+
+    const receipt = await this.client.recipient.remunerate(blsCertificate);
     console.log(`  [4Mica] Remuneration tx confirmed: ${receipt.transactionHash}`);
 
     return {
@@ -757,12 +512,8 @@ export class FourMicaClient {
     if (!this.initialized) {
       await this.initialize();
     }
-    // In local mode, we don't have a Client — that's OK
-    if (!this.localMode && !this.client) {
+    if (!this.client) {
       throw new Error('4Mica client not initialized');
-    }
-    if (this.localMode && !this.initialized) {
-      throw new Error('4Mica client not initialized (local mode)');
     }
   }
 
@@ -790,6 +541,7 @@ export class FourMicaClient {
     if (this.client) {
       await this.client.aclose();
       this.client = null;
+      this.sdk = null;
       this.initialized = false;
     }
   }
