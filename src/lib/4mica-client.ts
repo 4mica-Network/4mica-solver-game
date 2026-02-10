@@ -15,6 +15,7 @@ import {
   SigningScheme,
   PaymentGuaranteeRequestClaims,
   PaymentSigner,
+  buildPaymentPayload,
   type PaymentRequirementsV2,
   type X402SignedPayment,
 } from '@4mica/sdk';
@@ -209,6 +210,19 @@ export class FourMicaClient {
     // Step 2: Generate mock signature (in real flow, trader would sign)
     const mockSignature = '0x' + 'e'.repeat(130); // Mock EIP-712 signature
 
+    // Build SDK-aligned claims + payload (for type compatibility)
+    const claims = PaymentGuaranteeRequestClaims.new(
+      traderAddress,
+      recipientAddress,
+      tabId,
+      amount,
+      timestamp,
+      token,
+      reqId
+    );
+    const mockPaymentSig = { signature: mockSignature, scheme: SigningScheme.EIP712 };
+    const paymentPayload = buildPaymentPayload(claims, mockPaymentSig);
+
     // Step 3: Issue guarantee via mock API RPC
     const guaranteeResponse = await fetch(this.config.rpcUrl, {
       method: 'POST',
@@ -252,25 +266,10 @@ export class FourMicaClient {
         x402Version: 1,
         scheme: '4mica-credit',
         network: 'eip155:11155111',
+        payload: paymentPayload,
       })).toString('base64'),
-      payload: {
-        claims: {
-          version: '1',
-          user_address: traderAddress,
-          recipient_address: recipientAddress,
-          tab_id: tabId.toString(),
-          req_id: reqId.toString(),
-          amount: amount.toString(),
-          timestamp,
-          asset_address: token,
-        },
-        signature: mockSignature,
-        scheme: SigningScheme.EIP712,
-      },
-      signature: {
-        scheme: SigningScheme.EIP712,
-        signature: mockSignature,
-      },
+      payload: paymentPayload,
+      signature: mockPaymentSig,
     };
 
     return {
@@ -545,6 +544,8 @@ export class FourMicaClient {
     );
     console.log(`  [4Mica] Claims signed: ${paymentSig.signature.slice(0, 30)}...`);
 
+    const paymentPayload = buildPaymentPayload(claims, paymentSig);
+
     // =========================================================================
     // Step 5: Issue guarantee — Solver submits to 4Mica as RECIPIENT
     // This is the critical step: 4Mica verifies the signature, checks the trader's
@@ -578,25 +579,10 @@ export class FourMicaClient {
         x402Version: 1,
         scheme: '4mica-credit',
         network: `eip155:${this.client!.params.chainId}`,
+        payload: paymentPayload,
       })).toString('base64'),
-      payload: {
-        claims: {
-          version: '1',
-          user_address: traderAddress,
-          recipient_address: recipientAddress,
-          tab_id: tabId.toString(),
-          req_id: reqId.toString(),
-          amount: amount.toString(),
-          timestamp,
-          asset_address: token,
-        },
-        signature: paymentSig.signature,
-        scheme: paymentSig.scheme,
-      },
-      signature: {
-        scheme: paymentSig.scheme,
-        signature: paymentSig.signature,
-      },
+      payload: paymentPayload,
+      signature: paymentSig,
     };
 
     return {
@@ -749,20 +735,8 @@ export class FourMicaClient {
     }
 
     // Sepolia: Use SDK's RecipientClient.remunerate(cert) for on-chain collateral seizure.
-    //
-    // IMPORTANT: The 4Mica server returns cert.claims and cert.signature as hex
-    // strings WITHOUT the '0x' prefix. SDK internals (viem.toBytes, signatureToWords)
-    // treat non-0x strings as UTF-8, producing garbage bytes. Fix: ensure both
-    // fields have a '0x' prefix so they're correctly interpreted as hex.
-    const ensureHexPrefix = (hex: string) => hex.startsWith('0x') ? hex : `0x${hex}`;
-    const normalizedCert: BLSCert = {
-      ...blsCertificate,
-      claims: ensureHexPrefix(blsCertificate.claims),
-      signature: ensureHexPrefix(blsCertificate.signature),
-    };
-
-    console.log(`  [4Mica] Calling SDK remunerate (claims ${normalizedCert.claims.length} chars, sig ${normalizedCert.signature.length} chars)...`);
-    const receipt = await this.client!.recipient.remunerate(normalizedCert);
+    console.log(`  [4Mica] Calling SDK remunerate (claims ${blsCertificate.claims.length} chars, sig ${blsCertificate.signature.length} chars)...`);
+    const receipt = await this.client!.recipient.remunerate(blsCertificate);
     console.log(`  [4Mica] Remuneration tx confirmed: ${receipt.transactionHash}`);
 
     return {
