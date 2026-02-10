@@ -80,10 +80,11 @@ export interface SettlementManagerConfig {
   fourMicaRpcUrl?: string;
   recipientAddress?: Address; // Solver/recipient address for tabs
   tokenAddress?: Address; // Token (e.g., USDC) for 4Mica operations
-  solverPrivateKey?: `0x${string}`; // Solver's private key for X402 flow
-  tabProxyUrl?: string; // Local proxy URL for FourMicaEvmScheme (e.g., http://localhost:3001)
+  solverPrivateKey?: `0x${string}`; // Solver's private key for SDK operations
   // Getter function to retrieve private keys for traders/agents
   getPrivateKey?: (agentId: string) => `0x${string}` | undefined;
+  // Demo mode: skip real 4Mica API calls, use simulated settlement
+  demoMode?: boolean;
 }
 
 // =============================================================================
@@ -130,7 +131,9 @@ export class SettlementManager extends EventEmitter {
     console.log(`[SettlementManager] Starting settlement monitoring (Tab Mode)`);
     console.log(`[SettlementManager] Settlement window: ${this.config.settlementWindowSeconds}s`);
     console.log(`[SettlementManager] Unhappy path probability: ${(this.config.unhappyPathProbability * 100).toFixed(0)}%`);
-    if (this.config.fourMicaRpcUrl) {
+    if (this.config.demoMode) {
+      console.log(`[SettlementManager] 🎭 DEMO MODE: Using simulated settlement (no real 4Mica calls)`);
+    } else if (this.config.fourMicaRpcUrl) {
       console.log(`[SettlementManager] 4Mica API: ${this.config.fourMicaRpcUrl}`);
     }
 
@@ -220,8 +223,12 @@ export class SettlementManager extends EventEmitter {
 
   /**
    * Refresh collateral data for all active tabs
+   * In DEMO MODE, skip actual 4Mica API calls
    */
   private async refreshCollateralData(): Promise<void> {
+    // Skip real 4Mica collateral refresh in DEMO MODE
+    if (this.config.demoMode) return;
+
     for (const [traderId, tab] of this.traderTabs) {
       if (tab.status !== 'open') continue;
 
@@ -255,13 +262,11 @@ export class SettlementManager extends EventEmitter {
         privateKey: this.config.solverPrivateKey,
         accountId: 'settlement-solver',
         tokenAddress: this.config.tokenAddress,
-        // tabProxyUrl is where FourMicaEvmScheme will call for tab creation
-        // The game server's /payment/tab endpoint uses FourMicaFacilitatorClient
-        tabProxyUrl: this.config.tabProxyUrl,
+        // In local mode, facilitatorUrl points to mock 4Mica API
+        facilitatorUrl: this.config.fourMicaRpcUrl.replace(/\/$/, ''),
       });
       await this.fourMicaSolverClient.initialize();
-      console.log(`[SettlementManager] Solver client initialized with @4mica/x402 SDK`);
-      console.log(`[SettlementManager] Tab proxy URL: ${this.config.tabProxyUrl}`);
+      console.log(`[SettlementManager] Solver client initialized with @4mica/sdk`);
       return this.fourMicaSolverClient;
     } catch (error) {
       console.error(`[SettlementManager] Failed to init Solver client:`, error);
@@ -332,30 +337,23 @@ export class SettlementManager extends EventEmitter {
 
   /**
    * Enforce remuneration for a 4Mica tab (unhappy path)
-   * This seizes the locked collateral and releases it to the recipient via the facilitator
+   * Uses the SOLVER's client (recipient) to call RecipientClient.remunerate(blsCert).
+   * The solver seizes the trader's locked collateral on-chain.
    */
   private async enforceFourMicaTab(traderAddress: Address, traderId: string, guarantee?: PaymentGuarantee): Promise<string | null> {
-    const client = await this.getFourMicaClient(traderAddress, traderId);
-    if (!client) return null;
+    // Remuneration is a RECIPIENT operation — use the Solver's client, not the trader's
+    const solverClient = await this.getSolverClient();
+    if (!solverClient) return null;
 
-    // Can't enforce without a valid guarantee
-    if (!guarantee?.signedPayment) {
-      console.error(`[SettlementManager] Cannot enforce remuneration for ${traderId}: no signed payment`);
+    // Can't enforce without a valid BLS certificate from issuePaymentGuarantee
+    if (!guarantee?.certificate) {
+      console.error(`[SettlementManager] Cannot enforce remuneration for ${traderId}: no BLS certificate`);
       return null;
     }
 
     try {
-      const result = await client.enforceRemuneration(
-        guarantee.signedPayment,
-        {
-          scheme: 'x402-4mica',  // Scheme must include '4mica' per SDK validation
-          network: 'ethereum-sepolia',
-          asset: this.config.tokenAddress || '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238' as Address,
-          amount: guarantee.claims.amount.toString(),
-          payTo: guarantee.claims.recipient,
-          maxTimeoutSeconds: this.config.settlementWindowSeconds,
-        }
-      );
+      // RecipientClient.remunerate(cert) — direct on-chain collateral seizure
+      const result = await solverClient.enforceRemuneration(guarantee.certificate);
       console.log(`[SettlementManager] 4Mica remuneration enforced for ${traderId}: ${result.txHash}`);
       return result.txHash;
     } catch (error) {
@@ -460,9 +458,9 @@ export class SettlementManager extends EventEmitter {
       tab.intentIds.push(intentId);
       tab.fourMicaGuarantees.push(intentGuarantee);
 
-      // Verify same tabId (SDK should auto-batch)
+      // 4Mica reuses the same tab for a user-recipient pair, so tabId should match
       if (tab.fourMicaTabId && tab.fourMicaTabId !== guarantee.claims.tabId) {
-        console.warn(`[SettlementManager] WARNING: Different tabId! Expected ${tab.fourMicaTabId}, got ${guarantee.claims.tabId}`);
+        console.log(`[SettlementManager] Note: tabId changed from ${tab.fourMicaTabId} to ${guarantee.claims.tabId} (unexpected)`);
       }
 
       // Update collateral data
@@ -608,7 +606,13 @@ export class SettlementManager extends EventEmitter {
 
     let finalTxHash = txHash;
 
-    if (isHappyPath) {
+    // In DEMO MODE, skip real 4Mica API calls and use simulated settlement
+    if (this.config.demoMode) {
+      // Generate simulated transaction hash for demo
+      finalTxHash = `0xDEMO_${Date.now().toString(16)}_${Math.random().toString(16).slice(2)}`.slice(0, 66);
+      console.log(`[SettlementManager] DEMO MODE: Simulating ${isHappyPath ? 'happy' : 'unhappy'} path settlement`);
+      console.log(`[SettlementManager] DEMO txHash: ${finalTxHash}`);
+    } else if (isHappyPath) {
       // HAPPY PATH: Single payTab call with latest reqId and cumulative total
       console.log(`[SettlementManager] Paying cumulative total with latest reqId...`);
 

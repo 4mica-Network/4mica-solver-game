@@ -26,7 +26,7 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { sepolia } from 'viem/chains';
-import { MockERC20ABI, SimpleAMMABI } from '../src/lib/abis';
+import { MockERC20ABI, SimpleAMMABI } from '../src/lib/abis.js';
 import chalk from 'chalk';
 import { writeFileSync, readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';

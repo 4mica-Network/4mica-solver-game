@@ -34,19 +34,16 @@ const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL!;
 // Use official Circle USDC for 4Mica (not our custom AMM USDC)
 const FOURMICA_USDC_ADDRESS = (process.env.FOURMICA_USDC_ADDRESS || '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238') as Address;
 
-// All wallets that need collateral (traders AND solvers)
+// Configurable deposit amount (default: $5 USDC)
+// Override with: DEPOSIT_AMOUNT=10 npx tsx scripts/deposit-collateral.ts
+const DEPOSIT_AMOUNT = parseUnits(process.env.DEPOSIT_AMOUNT || '5', 6);
+
+// All wallets that need collateral
+// Only traders need 4Mica collateral (backs their payment guarantees).
+// Solvers don't need deposits — they receive payment, not provide guarantees.
 const WALLETS = [
-  // Traders (need collateral to back their payment guarantees)
   { name: 'Trader-SpreadHawk', key: process.env.TRADER_SPREADHAWK_PRIVATE_KEY as `0x${string}`, role: 'trader' },
   { name: 'Trader-DeepScan', key: process.env.TRADER_DEEPSCAN_PRIVATE_KEY as `0x${string}`, role: 'trader' },
-  { name: 'Trader-QuickFlip', key: process.env.TRADER_QUICKFLIP_PRIVATE_KEY as `0x${string}`, role: 'trader' },
-  { name: 'Trader-SteadyEdge', key: process.env.TRADER_STEADYEDGE_PRIVATE_KEY as `0x${string}`, role: 'trader' },
-  // Solvers (need collateral for recipient operations scope)
-  { name: 'Solver-AlphaStrike', key: process.env.SOLVER_ALPHASTRIKE_PRIVATE_KEY as `0x${string}`, role: 'solver' },
-  { name: 'Solver-ProfitMax', key: process.env.SOLVER_PROFITMAX_PRIVATE_KEY as `0x${string}`, role: 'solver' },
-  { name: 'Solver-Balanced', key: process.env.SOLVER_BALANCED_PRIVATE_KEY as `0x${string}`, role: 'solver' },
-  { name: 'Solver-CoWMatcher', key: process.env.SOLVER_COWMATCHER_PRIVATE_KEY as `0x${string}`, role: 'solver' },
-  { name: 'Solver-GasOptimizer', key: process.env.SOLVER_GASOPTIMIZER_PRIVATE_KEY as `0x${string}`, role: 'solver' },
 ].filter(w => w.key); // Only include wallets with keys
 
 // ERC20 ABI for USDC operations
@@ -77,14 +74,11 @@ const ERC20_ABI = [
   },
 ] as const;
 
-// Minimum balance to keep (don't deposit everything)
-const MIN_KEEP_BALANCE = parseUnits('1', 6); // Keep 1 USDC as buffer
-
 async function main() {
   console.log('🏦 4Mica Collateral Deposit Script\n');
   console.log(`Circle USDC Address: ${FOURMICA_USDC_ADDRESS}`);
   console.log(`4Mica RPC: ${FOURMICA_RPC_URL}`);
-  console.log(`Mode: Deposit available balance (keeping 1 USDC buffer)\n`);
+  console.log(`Deposit Amount: ${formatUnits(DEPOSIT_AMOUNT, 6)} USDC per trader\n`);
 
   // Create public client for reading
   const publicClient = createPublicClient({
@@ -118,16 +112,16 @@ async function main() {
       });
       console.log(`   Circle USDC Balance: ${formatUnits(usdcBalance, 6)} USDC`);
 
-      // Calculate deposit amount (balance minus buffer)
-      const depositAmount = usdcBalance > MIN_KEEP_BALANCE ? usdcBalance - MIN_KEEP_BALANCE : 0n;
+      // Use fixed deposit amount
+      const depositAmount = DEPOSIT_AMOUNT;
 
-      if (depositAmount <= 0n) {
-        console.log(`   ❌ No USDC available to deposit (need more than 1 USDC)`);
+      if (usdcBalance < depositAmount) {
+        console.log(`   ❌ Insufficient USDC: have ${formatUnits(usdcBalance, 6)}, need ${formatUnits(depositAmount, 6)}`);
         console.log(`   💡 Get testnet USDC from Circle faucet: https://faucet.circle.com/`);
         continue;
       }
 
-      console.log(`   💰 Will deposit: ${formatUnits(depositAmount, 6)} USDC`);
+      console.log(`   💰 Will deposit: ${formatUnits(depositAmount, 6)} USDC (wallet has ${formatUnits(usdcBalance, 6)})`);
 
       // Check ETH balance for gas
       const ethBalance = await publicClient.getBalance({ address: account.address });

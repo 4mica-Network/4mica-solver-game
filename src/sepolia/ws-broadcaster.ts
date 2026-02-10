@@ -136,6 +136,7 @@ export class WSBroadcaster {
       subscriptions: new Set([
         'price:update',
         'intent:created',
+        'intent:bid',
         'intent:claimed',
         'intent:executed',
         'settlement:countdown',
@@ -146,6 +147,7 @@ export class WSBroadcaster {
         'tab:settled',
         'tab:collateralUpdate',
         'leaderboard:update',
+        'stats:update',
       ]),
     };
 

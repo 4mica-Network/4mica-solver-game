@@ -21,6 +21,25 @@ import type { Address } from 'viem';
 // Types
 // =============================================================================
 
+// Request/Response types for POST endpoints
+export interface CreateIntentRequest {
+  traderId: string;
+  amount: number; // Amount in micro-units (1,000,000 = $1 USDC)
+}
+
+export interface SubmitBidRequest {
+  solverId: string;
+  bidScore: number;
+  executionTimeEstimateMs: number;
+  profitShareBps: number;
+}
+
+// Callback type for creating intents with 4Mica guarantee
+export type CreateIntentCallback = (
+  traderId: string,
+  amount: bigint
+) => Promise<{ success: boolean; intentId?: string; error?: string }>;
+
 export interface APIContext {
   priceIndexer: PriceIndexer;
   intentManager: IntentManager;
@@ -28,6 +47,8 @@ export interface APIContext {
   reputationManager: ReputationManager;
   solverAddresses: Address[];
   agentProfiles: Map<string, AgentProfile>;
+  // Callback for creating intents with 4Mica guarantee (provided by GameServer)
+  createIntentWithGuarantee?: CreateIntentCallback;
 }
 
 export interface AgentProfile {
@@ -173,6 +194,188 @@ export function createAPIRoutes(context: APIContext): Router {
   });
 
   // ===========================================================================
+  // Intent POST Endpoints (for AI Agents)
+  // ===========================================================================
+
+  /**
+   * POST /api/intents
+   * Create a new trade intent (for Trader AI agents)
+   *
+   * This endpoint triggers the full 4Mica X402 flow:
+   * 1. Validates trader exists and is registered
+   * 2. Checks current price spread for arbitrage opportunity
+   * 3. Requests 4Mica payment guarantee (locks collateral)
+   * 4. Creates intent if guarantee approved
+   *
+   * Request body:
+   * {
+   *   traderId: string,    // Registered trader agent ID
+   *   amount: number       // Amount in micro-units (1,000,000 = $1 USDC)
+   * }
+   */
+  router.post('/intents', async (req: Request, res: Response) => {
+    try {
+      const body = req.body as CreateIntentRequest;
+
+      // Validate request
+      if (!body.traderId) {
+        return res.status(400).json({ error: 'Missing traderId' });
+      }
+      if (!body.amount || body.amount <= 0) {
+        return res.status(400).json({ error: 'Invalid amount (must be positive)' });
+      }
+
+      // Check amount limit (max 1 USDC = 1,000,000 micro-units)
+      if (body.amount > 1_000_000) {
+        return res.status(400).json({
+          error: 'Amount exceeds limit (max 1 USDC)',
+          maxAmount: 1_000_000,
+        });
+      }
+
+      // Validate trader exists
+      const profile = context.agentProfiles.get(body.traderId);
+      if (!profile) {
+        return res.status(404).json({ error: 'Trader not found' });
+      }
+      if (profile.role !== 'trader') {
+        return res.status(400).json({ error: 'Agent is not a trader' });
+      }
+
+      // Check for arbitrage opportunity
+      const priceData = context.priceIndexer.getLastPrice();
+      if (!priceData) {
+        return res.status(503).json({ error: 'Price data not available' });
+      }
+
+      const hasOpportunity = context.priceIndexer.hasOpportunity();
+      if (!hasOpportunity) {
+        return res.status(400).json({
+          error: 'No arbitrage opportunity detected',
+          currentSpread: priceData.spreadBps,
+          hint: 'Wait for spread to exceed threshold',
+        });
+      }
+
+      // Check if createIntentWithGuarantee callback is available
+      if (!context.createIntentWithGuarantee) {
+        return res.status(501).json({
+          error: 'Intent creation not configured',
+          hint: 'Server needs createIntentWithGuarantee callback',
+        });
+      }
+
+      // Create intent via callback (handles 4Mica guarantee flow)
+      const result = await context.createIntentWithGuarantee(
+        body.traderId,
+        BigInt(body.amount)
+      );
+
+      if (!result.success) {
+        return res.status(400).json({
+          error: result.error || 'Failed to create intent',
+          hint: 'Ensure trader has sufficient 4Mica collateral',
+        });
+      }
+
+      // Get the created intent
+      const intent = context.intentManager.getIntent(result.intentId!);
+
+      res.status(201).json({
+        success: true,
+        intent: intent ? formatIntent(intent) : null,
+        message: '4Mica guarantee approved, intent created',
+      });
+    } catch (error) {
+      console.error('[API] Error creating intent:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  /**
+   * POST /api/intents/:id/bid
+   * Submit a bid on a pending intent (for Solver AI agents)
+   *
+   * Solvers compete by submitting bids with:
+   * - bidScore: Higher score = higher priority
+   * - executionTimeEstimateMs: Estimated execution time
+   * - profitShareBps: Profit share offered to trader (in basis points)
+   *
+   * Request body:
+   * {
+   *   solverId: string,
+   *   bidScore: number,
+   *   executionTimeEstimateMs: number,
+   *   profitShareBps: number
+   * }
+   */
+  router.post('/intents/:id/bid', (req: Request, res: Response) => {
+    try {
+      const intentId = req.params.id;
+      const body = req.body as SubmitBidRequest;
+
+      // Validate request
+      if (!body.solverId) {
+        return res.status(400).json({ error: 'Missing solverId' });
+      }
+      if (typeof body.bidScore !== 'number' || body.bidScore < 0) {
+        return res.status(400).json({ error: 'Invalid bidScore (must be non-negative)' });
+      }
+
+      // Validate solver exists
+      const profile = context.agentProfiles.get(body.solverId);
+      if (!profile) {
+        return res.status(404).json({ error: 'Solver not found' });
+      }
+      if (profile.role !== 'solver') {
+        return res.status(400).json({ error: 'Agent is not a solver' });
+      }
+
+      // Check intent exists and is pending
+      const intent = context.intentManager.getIntent(intentId);
+      if (!intent) {
+        return res.status(404).json({ error: 'Intent not found' });
+      }
+      if (intent.status !== 'pending') {
+        return res.status(400).json({
+          error: 'Intent is not accepting bids',
+          status: intent.status,
+        });
+      }
+
+      // Build solver bid
+      const bid: SolverBid = {
+        solverId: body.solverId,
+        solverAddress: profile.address,
+        solverName: profile.name,
+        bidScore: body.bidScore,
+        executionTimeEstimateMs: body.executionTimeEstimateMs || 2000,
+        profitShareBps: body.profitShareBps || 200,
+        timestamp: Date.now(),
+      };
+
+      // Submit bid
+      const success = context.intentManager.submitBid(intentId, bid);
+
+      if (!success) {
+        return res.status(400).json({
+          error: 'Bid rejected',
+          hint: 'Solver may have already bid or intent has no guarantee',
+        });
+      }
+
+      res.status(201).json({
+        success: true,
+        bid: formatBid(bid),
+        message: 'Bid submitted successfully',
+      });
+    } catch (error) {
+      console.error('[API] Error submitting bid:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // ===========================================================================
   // Settlement Endpoints
   // ===========================================================================
 
@@ -271,12 +474,16 @@ export function createAPIRoutes(context: APIContext): Router {
   router.get('/leaderboard', async (req: Request, res: Response) => {
     try {
       const limit = parseInt(req.query.limit as string) || 10;
-      const leaderboard = await context.reputationManager.getTopSolvers(limit);
+      // Use buildLeaderboard with all registered solver addresses so solvers
+      // appear with their names even before any settlements have occurred
+      const leaderboard = await context.reputationManager.buildLeaderboard(
+        context.solverAddresses
+      );
 
       res.json({
         count: leaderboard.length,
         updatedAt: Date.now(),
-        data: leaderboard.map(formatLeaderboardEntry),
+        data: leaderboard.slice(0, limit).map(formatLeaderboardEntry),
       });
     } catch (error) {
       res.status(500).json({ error: 'Failed to fetch leaderboard' });

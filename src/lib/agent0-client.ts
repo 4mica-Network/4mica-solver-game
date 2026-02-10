@@ -405,16 +405,18 @@ export class Agent0Client {
     comment: string = '',
     context: string = ''
   ): Promise<{ txHash: string }> {
-    if (!this.walletClient || !this.account) {
-      throw new Error('Wallet client not initialized. Provide privateKey in config.');
-    }
-
     const reputationAddress = this.config.reputationAddress || Agent0Client.DEFAULT_REPUTATION;
 
+    // In local/demo mode (no reputation contract deployed), simulate feedback
+    // This path doesn't need a wallet client at all
     if (reputationAddress === Agent0Client.DEFAULT_REPUTATION) {
-      // Simulate feedback
       console.log(`  [Simulated] Feedback to ${toAddress}: score=${score}, comment="${comment}"`);
       return { txHash: '0x' + '0'.repeat(64) };
+    }
+
+    // Only require wallet for real on-chain feedback
+    if (!this.walletClient || !this.account) {
+      throw new Error('Wallet client not initialized. Provide privateKey in config.');
     }
 
     const hash = await this.walletClient.writeContract({

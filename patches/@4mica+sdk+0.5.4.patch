@@ -1,0 +1,15 @@
+diff --git a/node_modules/@4mica/sdk/dist/bls.js b/node_modules/@4mica/sdk/dist/bls.js
+index abcdef1..1234567 100644
+--- a/node_modules/@4mica/sdk/dist/bls.js
++++ b/node_modules/@4mica/sdk/dist/bls.js
+@@ -41,8 +41,8 @@
+         const sigBytes = (0, viem_1.toBytes)(signatureHex);
+         const point = curves.bls12_381.G2.ProjectivePoint.fromHex(sigBytes);
+         const affine = point.toAffine();
+-        const [x0, x1] = affine.x.c;
+-        const [y0, y1] = affine.y.c;
++        const [x0, x1] = [affine.x.c0, affine.x.c1];
++        const [y0, y1] = [affine.y.c0, affine.y.c1];
+         const coords = [x0, x1, y0, y1].map((fp) => toBigint(fp));
+         const words = [];
+         coords.forEach((coord) => {

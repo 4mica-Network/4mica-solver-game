@@ -13,13 +13,42 @@
  *   npm run start:sepolia
  */
 
-import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { createServer } from 'http';
 import chalk from 'chalk';
 import type { Address } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+
+// Configuration — load BEFORE any other imports that might read process.env
+import { config as dotenvConfig } from 'dotenv';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Determine which env file to load based on how we're started:
+// - npm run start:sepolia → loads .env.sepolia (Sepolia testnet)
+// - npm run start:local   → loads .env.local (local Hardhat)
+// Check for explicit ENV_FILE override, then detect from LOCAL_MODE or default to .env.sepolia
+const envFile = process.env.ENV_FILE || (process.env.LOCAL_MODE === 'true' ? '.env.local' : '.env.sepolia');
+const envPaths = [
+  join(process.cwd(), envFile),
+  join(__dirname, '../../', envFile),       // From source: src/sepolia -> project root
+  join(__dirname, '../../../', envFile),    // From compiled: dist/src/sepolia -> project root
+];
+let envLoaded = false;
+for (const envPath of envPaths) {
+  const result = dotenvConfig({ path: envPath });
+  if (!result.error) {
+    console.log(`[Config] Loaded environment from: ${envPath}`);
+    envLoaded = true;
+    break;
+  }
+}
+if (!envLoaded) {
+  console.warn(`[Config] Warning: Could not find ${envFile}. Falling back to process.env.`);
+}
 
 // Local modules
 import { createPriceIndexer, type PriceIndexerConfig, type ArbitrageOpportunity } from './price-indexer.js';
@@ -29,26 +58,6 @@ import { createWSBroadcaster, type BroadcasterConfig } from './ws-broadcaster.js
 import { createAPIRoutes, type APIContext, type AgentProfile } from './api/routes.js';
 import { createReputationManager, type SettlementOutcome } from '../lib/reputation.js';
 import { FourMicaClient, type PaymentClaims } from '../lib/4mica-client.js';
-
-// Configuration
-import { config as dotenvConfig } from 'dotenv';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-// Try multiple paths to find .env.sepolia (works for both source and compiled)
-const envPaths = [
-  join(__dirname, '../../.env.sepolia'),      // From source: src/sepolia -> project root
-  join(__dirname, '../../../.env.sepolia'),   // From compiled: dist/src/sepolia -> project root
-  join(process.cwd(), '.env.sepolia'),        // From current working directory
-];
-for (const envPath of envPaths) {
-  const result = dotenvConfig({ path: envPath });
-  if (!result.error) {
-    console.log(`[Config] Loaded environment from: ${envPath}`);
-    break;
-  }
-}
 
 // =============================================================================
 // Configuration Loading
@@ -62,17 +71,21 @@ interface ServerConfig {
   usdcAddress: Address;  // AMM USDC (custom deployment)
   usdtAddress: Address;
   fourMicaUsdcAddress: Address;  // Official Circle USDC for 4Mica collateral
+  fourMicaRpcUrl: string;  // 4Mica SDK RPC endpoint
+  fourMicaFacilitatorUrl: string;  // 4Mica X402 facilitator endpoint
   priceCheckIntervalMs: number;
   spreadThresholdBps: number;
   settlementWindowSeconds: number;
   unhappyPathProbability: number;
   pinataJwt: string;
   demoMode: boolean;  // Use simulated guarantees when 4Mica fails
+  localMode: boolean;  // Use local mock 4Mica API
 }
 
 function loadConfig(): ServerConfig {
-  const rpcUrl = process.env.SEPOLIA_RPC_URL;
-  if (!rpcUrl) throw new Error('SEPOLIA_RPC_URL not configured');
+  // Support both local (LOCAL_RPC_URL) and Sepolia (SEPOLIA_RPC_URL) modes
+  const rpcUrl = process.env.LOCAL_RPC_URL || process.env.SEPOLIA_RPC_URL;
+  if (!rpcUrl) throw new Error('RPC URL not configured (set LOCAL_RPC_URL or SEPOLIA_RPC_URL)');
 
   const ammAlpha = process.env.AMM_ALPHA_ADDRESS;
   const ammBeta = process.env.AMM_BETA_ADDRESS;
@@ -86,6 +99,10 @@ function loadConfig(): ServerConfig {
   // Official Circle USDC on Sepolia for 4Mica collateral
   const fourMicaUsdc = process.env.FOURMICA_USDC_ADDRESS || '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238';
 
+  // 4Mica API URLs (defaults to Sepolia, can be overridden for local mock)
+  const fourMicaRpcUrl = process.env.FOURMICA_RPC_URL || 'https://ethereum.sepolia.api.4mica.xyz/';
+  const fourMicaFacilitatorUrl = process.env.FOURMICA_FACILITATOR_URL || 'https://x402.4mica.xyz';
+
   return {
     port: parseInt(process.env.SERVER_PORT || '3001'),
     rpcUrl,
@@ -94,12 +111,15 @@ function loadConfig(): ServerConfig {
     usdcAddress: usdc as Address,
     usdtAddress: usdt as Address,
     fourMicaUsdcAddress: fourMicaUsdc as Address,
+    fourMicaRpcUrl,
+    fourMicaFacilitatorUrl,
     priceCheckIntervalMs: parseInt(process.env.PRICE_CHECK_INTERVAL_MS || '2000'),
     spreadThresholdBps: parseInt(process.env.SPREAD_THRESHOLD_BPS || '50'),
     settlementWindowSeconds: parseInt(process.env.SETTLEMENT_WINDOW_SECONDS || '30'),
     unhappyPathProbability: parseFloat(process.env.UNHAPPY_PATH_PROBABILITY || '0.05'),
     pinataJwt: process.env.PINATA_JWT || '',
     demoMode: process.env.DEMO_MODE === 'true',  // Set DEMO_MODE=true for simulated guarantees
+    localMode: process.env.LOCAL_MODE === 'true',  // Set LOCAL_MODE=true for local mock 4Mica
   };
 }
 
@@ -252,16 +272,14 @@ class GameServer {
       gracePeriodSeconds: 0, // No grace period - settle during countdown or at deadline
       countdownIntervalMs: 1000,
       unhappyPathProbability: this.config.unhappyPathProbability,
-      fourMicaRpcUrl: 'https://ethereum.sepolia.api.4mica.xyz/', // 4Mica API for collateral ops
+      fourMicaRpcUrl: this.config.fourMicaRpcUrl, // 4Mica API (local mock or Sepolia)
       recipientAddress: this.solverAddresses[0], // First solver as recipient
       tokenAddress: this.config.fourMicaUsdcAddress, // Official Circle USDC for 4Mica
-      solverPrivateKey: solverKey, // Solver's private key for X402 flow
-      // tabProxyUrl: FourMicaEvmScheme calls this endpoint for tab creation
-      // The game server's /payment/tab uses FourMicaFacilitatorClient.openTab()
-      // to properly transform the request (payTo -> recipientAddress)
-      tabProxyUrl: `http://localhost:${this.config.port}`,
+      solverPrivateKey: solverKey, // Solver's private key for SDK operations
       // Provide a function to get private keys for any agent (trader or solver)
       getPrivateKey: (agentId: string) => agentPrivateKeys.get(agentId),
+      // Demo mode: fallback to simulated guarantees if 4Mica fails
+      demoMode: this.config.demoMode,
     };
     this.settlementManager = createSettlementManager(settlementConfig, this.intentManager);
 
@@ -286,7 +304,7 @@ class GameServer {
   }
 
   private setupRoutes(): void {
-    // API context
+    // API context with createIntentWithGuarantee callback for AI agents
     const apiContext: APIContext = {
       priceIndexer: this.priceIndexer,
       intentManager: this.intentManager,
@@ -294,77 +312,13 @@ class GameServer {
       reputationManager: this.reputationManager,
       solverAddresses: this.solverAddresses,
       agentProfiles: this.agentProfiles,
+      // Callback for AI agents to create intents with 4Mica guarantee
+      createIntentWithGuarantee: this.createIntentWithGuarantee.bind(this),
     };
 
     // Mount API routes
     const apiRoutes = createAPIRoutes(apiContext);
     this.app.use('/api', apiRoutes);
-
-    // ==========================================================================
-    // X402 Tab Proxy Endpoint
-    //
-    // X402Flow.requestTab() sends { userAddress, paymentRequirements } to this endpoint.
-    // The facilitator expects: { userAddress, recipientAddress, network, erc20Token, ttlSeconds, amount }
-    //
-    // We transform the request while PRESERVING the amount field for off-chain collateral locking.
-    // ==========================================================================
-    this.app.post('/payment/tab', async (req, res) => {
-      try {
-        console.log(chalk.cyan('[X402 Proxy] Received tab request from X402Flow'));
-
-        // Extract data from the request that X402Flow.requestTab() sends
-        const { userAddress, paymentRequirements } = req.body;
-
-        if (!userAddress) {
-          return res.status(400).json({ error: 'Missing userAddress' });
-        }
-
-        // Transform the request to the format the facilitator expects
-        // Extract fields from paymentRequirements while preserving amount
-        const recipientAddress = paymentRequirements?.payTo;
-        const network = paymentRequirements?.network;
-        const erc20Token = paymentRequirements?.asset;
-        const amount = paymentRequirements?.amount;
-        const ttlSeconds = paymentRequirements?.maxTimeoutSeconds || 300;
-
-        console.log(chalk.cyan(`[X402 Proxy] Creating tab: user=${userAddress.slice(0, 10)}..., recipient=${recipientAddress?.slice(0, 10)}..., amount=${amount}`));
-
-        // Build the request body for the facilitator
-        // Include amount so the facilitator can lock collateral off-chain
-        const facilitatorUrl = 'https://x402.4mica.xyz';
-        const requestBody = {
-          userAddress,
-          recipientAddress,
-          network,
-          erc20Token,
-          ttlSeconds,
-          // Include amount for off-chain collateral locking
-          amount,
-        };
-
-        const response = await fetch(`${facilitatorUrl}/tabs`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(requestBody),
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.error(chalk.red(`[X402 Proxy] Facilitator error: ${response.status} ${errorText}`));
-          return res.status(response.status).json({ error: errorText });
-        }
-
-        const tabResponse = await response.json() as { tabId?: string; tab_id?: string };
-        console.log(chalk.green('[X402 Proxy] Tab created:'), tabResponse.tabId || tabResponse.tab_id);
-
-        return res.json(tabResponse);
-      } catch (error) {
-        console.error(chalk.red('[X402 Proxy] Error:'), error);
-        return res.status(500).json({ error: String(error) });
-      }
-    });
 
     // Root endpoint
     this.app.get('/', (req, res) => {
@@ -382,10 +336,9 @@ class GameServer {
           agents: '/api/agents',
           stats: '/api/stats',
           health: '/api/health',
-          x402Tab: '/payment/tab',
         },
         websocket: 'Connect to same port for real-time updates',
-        fourMica: '4Mica integration via @4mica/sdk and @4mica/x402',
+        fourMica: '4Mica integration via @4mica/sdk',
       });
     });
   }
@@ -518,19 +471,17 @@ class GameServer {
       }
 
       this.fourMicaSolverClient = new FourMicaClient({
-        rpcUrl: 'https://ethereum.sepolia.api.4mica.xyz/',
+        rpcUrl: this.config.fourMicaRpcUrl,
         privateKey: solverPrivateKey,
         accountId: 'Solver-AlphaStrike',
         tokenAddress: this.config.fourMicaUsdcAddress,
-        // tabProxyUrl: FourMicaEvmScheme calls this for tab creation
-        // Points to our /payment/tab endpoint which uses FourMicaFacilitatorClient
-        tabProxyUrl: `http://localhost:${this.config.port}`,
+        facilitatorUrl: this.config.fourMicaFacilitatorUrl,
       });
       await this.fourMicaSolverClient.initialize();
-      console.log(chalk.green(`[GameServer] Solver 4Mica client initialized`));
+      console.log(chalk.green(`[GameServer] Solver 4Mica client initialized (${this.config.localMode ? 'LOCAL' : 'SEPOLIA'})`));
     }
 
-    // Request 4Mica guarantee via X402 facilitator
+    // Request 4Mica guarantee via SDK
     try {
       // Get the TRADER's private key - payment must be signed by the payer
       const traderPrivateKey = agentPrivateKeys.get(trader.id);
@@ -582,16 +533,43 @@ class GameServer {
         };
 
         const recipientAddress = this.solverAddresses[0] || trader.address;
+        const now = Date.now();
+        const deadline = Math.floor(now / 1000) + this.config.settlementWindowSeconds;
 
-        console.log(chalk.magenta(`[GameServer] DEMO guarantee issued for ${trader.name}: ${this.formatAmount(amount)} USDC`));
+        // Create a FULL simulated PaymentGuarantee for settlement manager
+        // This allows local demo mode to work without real 4Mica collateral
+        const simulatedTabId = BigInt(Math.floor(Math.random() * 1000000) + 1);
+        const simulatedReqId = BigInt(Math.floor(Math.random() * 1000000) + 1);
 
-        // Create the intent with simulated certificate
+        const simulatedGuarantee = {
+          certificate: simulatedCert as any, // BLSCert-like object
+          claims: {
+            tabId: simulatedTabId,
+            amount: amount,
+            recipient: recipientAddress as Address,
+            deadline,
+            nonce: simulatedReqId, // reqId
+          },
+          signedPayment: {
+            header: `DEMO_HEADER_${now}`,
+            payload: {},
+            signature: { scheme: 'DEMO', signature: simulatedCert.signature },
+          } as any,
+          issuedAt: now,
+          expiresAt: deadline * 1000,
+          verified: true, // Mark as verified for demo
+        };
+
+        console.log(chalk.magenta(`[GameServer] DEMO guarantee issued for ${trader.name}: ${this.formatAmount(amount)} USDC (tabId=${simulatedTabId})`));
+
+        // Create the intent with BOTH certificate string AND full guarantee object
         this.intentManager.createIntent(
           trader.id,
           trader.address,
           opportunity,
           amount,
-          JSON.stringify(simulatedCert)
+          JSON.stringify(simulatedCert),
+          simulatedGuarantee // Full guarantee for settlement
         );
 
         this.recentTrades.push(Date.now());
@@ -601,6 +579,171 @@ class GameServer {
       console.log(chalk.yellow(`[GameServer] 4Mica guarantee REJECTED for ${trader.name}: ${errorMessage}`));
       // Don't create intent if guarantee was rejected
       return;
+    }
+  }
+
+  /**
+   * Create an intent with 4Mica guarantee (called by API for AI agents)
+   * This is the callback provided to the API context
+   */
+  private async createIntentWithGuarantee(
+    traderId: string,
+    amount: bigint
+  ): Promise<{ success: boolean; intentId?: string; error?: string }> {
+    // Find trader profile
+    const trader = this.agentProfiles.get(traderId);
+    if (!trader) {
+      return { success: false, error: 'Trader not found' };
+    }
+    if (trader.role !== 'trader') {
+      return { success: false, error: 'Agent is not a trader' };
+    }
+
+    // Get current price data for the opportunity
+    const priceData = this.priceIndexer.getLastPrice();
+    if (!priceData) {
+      return { success: false, error: 'Price data not available' };
+    }
+
+    // Ensure we have a valid arbitrage direction
+    if (priceData.direction === 'NONE') {
+      return { success: false, error: 'No arbitrage opportunity (direction is NONE)' };
+    }
+
+    // Build opportunity from current price data
+    const isBuyAlpha = priceData.direction === 'BETA_TO_ALPHA';
+    const opportunity: ArbitrageOpportunity = {
+      id: `arb_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      direction: priceData.direction as 'ALPHA_TO_BETA' | 'BETA_TO_ALPHA',
+      spreadBps: priceData.spreadBps,
+      buyAmmAddress: isBuyAlpha ? this.config.ammAlphaAddress : this.config.ammBetaAddress,
+      sellAmmAddress: isBuyAlpha ? this.config.ammBetaAddress : this.config.ammAlphaAddress,
+      expectedProfit: (amount * BigInt(priceData.spreadBps)) / 10000n,
+      timestamp: Date.now(),
+    };
+
+    // Throttle trades: max 2 per 60 seconds to conserve testnet USDC
+    const now = Date.now();
+    this.recentTrades = this.recentTrades.filter(t => now - t < this.TRADE_WINDOW_MS);
+
+    if (this.recentTrades.length >= this.MAX_TRADES_PER_WINDOW) {
+      const oldestTrade = this.recentTrades[0];
+      const waitTime = Math.ceil((this.TRADE_WINDOW_MS - (now - oldestTrade)) / 1000);
+      return {
+        success: false,
+        error: `Trade throttled - max ${this.MAX_TRADES_PER_WINDOW} per ${this.TRADE_WINDOW_MS/1000}s (wait ${waitTime}s)`,
+      };
+    }
+
+    // Initialize Solver client if not already done
+    if (!this.fourMicaSolverClient) {
+      const solverPrivateKey = agentPrivateKeys.get('Solver-AlphaStrike');
+      if (!solverPrivateKey) {
+        return { success: false, error: 'No solver private key configured' };
+      }
+
+      this.fourMicaSolverClient = new FourMicaClient({
+        rpcUrl: this.config.fourMicaRpcUrl,
+        privateKey: solverPrivateKey,
+        accountId: 'Solver-AlphaStrike',
+        tokenAddress: this.config.fourMicaUsdcAddress,
+        facilitatorUrl: this.config.fourMicaFacilitatorUrl,
+      });
+      await this.fourMicaSolverClient.initialize();
+      console.log(chalk.green(`[GameServer] Solver 4Mica client initialized via API (${this.config.localMode ? 'LOCAL' : 'SEPOLIA'})`));
+    }
+
+    // Get trader's private key for signing the payment
+    const traderPrivateKey = agentPrivateKeys.get(trader.id);
+    if (!traderPrivateKey) {
+      return { success: false, error: `No private key found for trader ${trader.id}` };
+    }
+
+    try {
+      // X402 Flow: Request 4Mica guarantee
+      const guarantee = await this.fourMicaSolverClient.issuePaymentGuarantee(
+        trader.address,
+        amount,
+        this.config.fourMicaUsdcAddress,
+        this.config.settlementWindowSeconds,
+        traderPrivateKey
+      );
+
+      const certPreview = guarantee.certificate.claims?.slice(0, 20) || 'issued';
+      console.log(chalk.cyan(`[GameServer] 4Mica guarantee APPROVED for ${trader.name} (via API): ${this.formatAmount(amount)} USDC (cert: ${certPreview}...)`));
+
+      // Create the intent
+      const intent = this.intentManager.createIntent(
+        trader.id,
+        trader.address,
+        opportunity,
+        amount,
+        JSON.stringify(guarantee.certificate),
+        guarantee
+      );
+
+      // Record trade for throttling
+      this.recentTrades.push(Date.now());
+
+      return { success: true, intentId: intent.id };
+
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      // In demo mode, create simulated guarantee
+      if (this.config.demoMode) {
+        console.log(chalk.yellow(`[GameServer] 4Mica failed (${errorMessage.slice(0, 30)}...), using DEMO MODE (via API)`));
+
+        const simulatedCert = {
+          claims: `DEMO_CERT_${Date.now()}_${trader.id}`,
+          signature: `DEMO_SIG_${Math.random().toString(36).slice(2)}`,
+        };
+
+        const recipientAddress = this.solverAddresses[0] || trader.address;
+        const now = Date.now();
+        const deadline = Math.floor(now / 1000) + this.config.settlementWindowSeconds;
+
+        // Create a FULL simulated PaymentGuarantee for settlement manager
+        const simulatedTabId = BigInt(Math.floor(Math.random() * 1000000) + 1);
+        const simulatedReqId = BigInt(Math.floor(Math.random() * 1000000) + 1);
+
+        const simulatedGuarantee = {
+          certificate: simulatedCert as any,
+          claims: {
+            tabId: simulatedTabId,
+            amount: amount,
+            recipient: recipientAddress as Address,
+            deadline,
+            nonce: simulatedReqId,
+          },
+          signedPayment: {
+            header: `DEMO_HEADER_${now}`,
+            payload: {},
+            signature: { scheme: 'DEMO', signature: simulatedCert.signature },
+          } as any,
+          issuedAt: now,
+          expiresAt: deadline * 1000,
+          verified: true,
+        };
+
+        console.log(chalk.magenta(`[GameServer] DEMO guarantee issued for ${trader.name} (via API): ${this.formatAmount(amount)} USDC (tabId=${simulatedTabId})`));
+
+        const intent = this.intentManager.createIntent(
+          trader.id,
+          trader.address,
+          opportunity,
+          amount,
+          JSON.stringify(simulatedCert),
+          simulatedGuarantee // Full guarantee for settlement
+        );
+
+        this.recentTrades.push(Date.now());
+
+        return { success: true, intentId: intent.id };
+      }
+
+      console.log(chalk.yellow(`[GameServer] 4Mica guarantee REJECTED for ${trader.name} (via API): ${errorMessage}`));
+      return { success: false, error: `4Mica guarantee rejected: ${errorMessage}` };
     }
   }
 
@@ -673,11 +816,15 @@ class GameServer {
   async start(): Promise<void> {
     return new Promise((resolve) => {
       this.server.listen(this.config.port, () => {
+        const networkMode = this.config.localMode ? 'LOCAL (Mock 4Mica)' : 'Sepolia';
         console.log(chalk.bold('\n🎮 4Mica × Agent0 Competitive Solver Game\n'));
         console.log(chalk.gray('─'.repeat(50)));
-        console.log(chalk.cyan('  Network:      ') + chalk.white('Sepolia'));
+        console.log(chalk.cyan('  Network:      ') + chalk.white(networkMode));
         console.log(chalk.cyan('  Server:       ') + chalk.white(`http://localhost:${this.config.port}`));
         console.log(chalk.cyan('  WebSocket:    ') + chalk.white(`ws://localhost:${this.config.port}`));
+        console.log(chalk.gray('─'.repeat(50)));
+        console.log(chalk.cyan('  4Mica RPC:    ') + chalk.white(this.config.fourMicaRpcUrl));
+        console.log(chalk.cyan('  Facilitator:  ') + chalk.white(this.config.fourMicaFacilitatorUrl));
         console.log(chalk.gray('─'.repeat(50)));
         console.log(chalk.cyan('  AMM-Alpha:    ') + chalk.white(this.config.ammAlphaAddress));
         console.log(chalk.cyan('  AMM-Beta:     ') + chalk.white(this.config.ammBetaAddress));
@@ -699,6 +846,10 @@ class GameServer {
           console.log(chalk.magenta('🎭 DEMO MODE: Using simulated 4Mica guarantees\n'));
         }
         console.log(chalk.gray('Press Ctrl+C to stop\n'));
+
+        // Broadcast initial leaderboard and stats so dashboard gets data immediately
+        this.broadcastLeaderboard();
+        this.broadcastStats();
 
         resolve();
       });
